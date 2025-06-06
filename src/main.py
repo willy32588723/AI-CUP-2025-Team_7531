@@ -232,7 +232,7 @@ def main():
             if train_avg_auc > best_auc:
                 best_auc = train_avg_auc
                 torch.save(model.state_dict(), args.model)
-                print("✅ Model saved.")
+                print("Model saved.")
             scheduler.step(train_avg_auc)
             early_stopping(train_avg_auc)
             if early_stopping.early_stop:
@@ -268,7 +268,7 @@ def main():
             if val_avg_auc > best_auc:
                 best_auc = val_avg_auc
                 torch.save(model.state_dict(), args.model)
-                print("✅ Model saved.")
+                print("Model saved.")
             scheduler.step(val_avg_auc)
             early_stopping(val_avg_auc)
             if early_stopping.early_stop:
