@@ -1,18 +1,20 @@
 import argparse
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
 import torch
 import torch.optim as optim
-import pandas as pd
-from torch_optimizer import Lookahead
+import torch.nn as nn
+from dataset import get_dataloader, get_test_dataloader
+from model import MultiBranchInceptionModel, smooth_focal_loss
 from sklearn.metrics import accuracy_score, roc_auc_score
 from sklearn.model_selection import train_test_split
-from model import MultiBranchInceptionModel, smooth_focal_loss
-from dataset import get_dataloader, get_test_dataloader
-import torch.nn as nn
+from sklearn.utils.class_weight import compute_class_weight
+from torch_optimizer import Lookahead
 from tqdm import tqdm
-import numpy as np
 
 class EarlyStopping:
-    def __init__(self, patience=5, delta=1e-4):
+    def __init__(self, patience=10, delta=1e-4):
         self.patience = patience
         self.counter = 0
         self.best_score = None
@@ -29,8 +31,8 @@ class EarlyStopping:
                 self.early_stop = True
 
 def get_class_weights(df):
-    from sklearn.utils.class_weight import compute_class_weight
     weights = {}
+
     for key, colname in [
         ("gender", "gender"),
         ("hand", "hold racket handed"),
@@ -41,6 +43,7 @@ def get_class_weights(df):
         classes = np.unique(labels)
         w = compute_class_weight(class_weight="balanced", classes=classes, y=labels)
         weights[key] = torch.tensor(w, dtype=torch.float32)
+        
     return weights
 
 def train_one_epoch(model, loader, criterion, optimizer, device):
@@ -48,6 +51,7 @@ def train_one_epoch(model, loader, criterion, optimizer, device):
     total_loss = 0
     preds, targets = {k: [] for k in ['gender', 'hand', 'players', 'level']}, {k: [] for k in ['gender', 'hand', 'players', 'level']}
     pred_labels, true_labels = {k: [] for k in preds}, {k: [] for k in preds}
+
     for data, stat, gender, hand, players, level, mode in tqdm(loader, leave=False):
         data = data.to(device)
         stat = stat.to(device)
@@ -67,6 +71,7 @@ def train_one_epoch(model, loader, criterion, optimizer, device):
         loss.backward()
         optimizer.step()
         total_loss += loss.item()
+
         for key in preds:
             if key in ['gender', 'hand']:
                 sigmoid_out = torch.sigmoid(outputs[key]).detach().cpu()
@@ -76,10 +81,12 @@ def train_one_epoch(model, loader, criterion, optimizer, device):
                 softmax_out = outputs[key].softmax(dim=1).detach().cpu()
                 preds[key].extend(softmax_out.numpy().tolist())
                 pred_labels[key].extend(outputs[key].argmax(dim=1).cpu().numpy())
+
         true_labels['gender'].extend(gender.cpu().numpy())
         true_labels['hand'].extend(hand.cpu().numpy())
         true_labels['players'].extend(players.cpu().numpy())
         true_labels['level'].extend(level.cpu().numpy())
+
     aucs = {}
     for k in preds:
         y_true = np.array(true_labels[k])
@@ -88,7 +95,9 @@ def train_one_epoch(model, loader, criterion, optimizer, device):
             aucs[k] = roc_auc_score(y_true, y_score, multi_class='ovr', average='micro')
         else:
             aucs[k] = roc_auc_score(y_true, y_score)
+
     accs = {k: accuracy_score(np.array(true_labels[k]), np.array(pred_labels[k])) for k in preds}
+
     return total_loss / len(loader), accs, aucs, np.mean(list(aucs.values()))
 
 @torch.no_grad()
@@ -139,15 +148,14 @@ def evaluate_one_epoch(model, loader, criterion, device):
         else:
             aucs[k] = roc_auc_score(y_true, y_score)
 
-    accs = {
-        k: accuracy_score(np.array(true_labels[k]), np.array(pred_labels[k])) for k in preds
-    }
+    accs = {k: accuracy_score(np.array(true_labels[k]), np.array(pred_labels[k])) for k in preds}
 
     return total_loss / len(loader), accs, aucs, np.mean(list(aucs.values()))
 
 def predict_test(model, test_loader, device):
     model.eval()
     predictions = {}
+
     with torch.no_grad():
         for ids, data, stat, modes in tqdm(test_loader, desc="Testing"):
             data = data.to(device)
@@ -166,10 +174,12 @@ def predict_test(model, test_loader, device):
                     *level_probs[i],
                 ]
                 predictions[uid] = row
+
     return predictions
 
 def save_predictions_to_csv(predictions, filename="submission.csv"):
     rows = []
+
     for uid in predictions:
         prob = predictions[uid]
         row = {
@@ -185,11 +195,13 @@ def save_predictions_to_csv(predictions, filename="submission.csv"):
             "level_5": round(prob[8], 4),
         }
         rows.append(row)
+
     df = pd.DataFrame(rows)
     df.to_csv(filename, index=False, float_format="%.4f")
     print(f"預測結果已儲存到 {filename}（保留 4 位小數）")
 
 def main():
+    #====================超參數與路徑設置====================================
     parser = argparse.ArgumentParser()
     parser.add_argument('--train_info', type=str ,default='39_Training_Dataset/train_info_augmented.csv')
     parser.add_argument('--train_data', type=str, default='39_Training_Dataset/train_data_augmented_level_year')
@@ -202,43 +214,50 @@ def main():
     parser.add_argument('--device', choices=['cuda', 'cpu'], default='cuda',)
     parser.add_argument('--model', type=str, default="best_inception_model.pt")
     args = parser.parse_args()
+
     if args.device == 'cuda' and torch.cuda.is_available():
         device = torch.device('cuda')
     else:
         device = torch.device('cpu')
     
-    full_df = pd.read_csv(args.train_info)
-    train_loader = get_dataloader(args.train_info, args.train_data, args.batch)
-    model = MultiBranchInceptionModel().to(device)
-    class_weights = get_class_weights(full_df)
-    criterion = {
-        'gender': nn.BCEWithLogitsLoss(pos_weight=class_weights['gender'][1].to(device)),
-        'hand': nn.BCEWithLogitsLoss(pos_weight=class_weights['hand'][1].to(device)),
-        'players': lambda input, target: smooth_focal_loss(input, target, alpha=class_weights['players'].to(device)),
-        'level':   lambda input, target: smooth_focal_loss(input, target, alpha=class_weights['level'].to(device)),
-    }
-    best_auc = 0
-    base_optim = optim.AdamW(model.parameters(), lr=args.lr)
-    optimizer = Lookahead(base_optim)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', 0.5, 5)
+    #=========================全部資料集用於訓練=========================================
     if args.mode == "train_full":
+        full_df = pd.read_csv(args.train_info)
+        train_loader = get_dataloader(args.train_info, args.train_data, args.batch)
+        model = MultiBranchInceptionModel().to(device)
+        class_weights = get_class_weights(full_df)
+        criterion = {
+            'gender': nn.BCEWithLogitsLoss(pos_weight=class_weights['gender'][1].to(device)),
+            'hand': nn.BCEWithLogitsLoss(pos_weight=class_weights['hand'][1].to(device)),
+            'players': lambda input, target: smooth_focal_loss(input, target, alpha=class_weights['players'].to(device)),
+            'level':   lambda input, target: smooth_focal_loss(input, target, alpha=class_weights['level'].to(device)),
+        }
+        best_auc = 0
+        base_optim = optim.AdamW(model.parameters(), lr=args.lr)
+        optimizer = Lookahead(base_optim)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', 0.5, 5)
         early_stopping = EarlyStopping(patience=10)
+
         for epoch in range(args.epochs):
             lr = optimizer.param_groups[0]['lr']
             train_loss, train_acc, train_aucs, train_avg_auc = train_one_epoch(model, train_loader, criterion, optimizer, device, lr)
             print(f"Epoch {epoch+1:02d} 🔁 LR: {lr:.2e}")
             print(f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc}")
             print(f"Train AUCs: {train_aucs} | Train Avg AUC: {train_avg_auc:.4f}")
+
             if train_avg_auc > best_auc:
                 best_auc = train_avg_auc
                 torch.save(model.state_dict(), args.model)
                 print("Model saved.")
             scheduler.step(train_avg_auc)
             early_stopping(train_avg_auc)
+
             if early_stopping.early_stop:
-                print(f"⏹️ Early stopping triggered at epoch {epoch+1}")
+                print(f"Early stopping triggered at epoch {epoch+1}")
                 break
-    if args.mode == "train_val":
+
+    #==========================切分訓練/驗證資料集(9:1)===================================
+    elif args.mode == "train_val":
         train_df, val_df = train_test_split(
             full_df, test_size=0.1, random_state=42, 
             stratify=full_df[['gender', 'hold racket handed', 'play years', 'level']]
@@ -258,6 +277,16 @@ def main():
         optimizer = Lookahead(base_optim)
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', 0.5, 5)
         early_stopping = EarlyStopping(patience=10)
+
+        train_losses, val_losses = [], []
+        train_avg_aucs, val_avg_aucs = [], []
+        train_accs, val_accs = [], []
+        task_keys = ['gender', 'hand', 'players', 'level']
+        train_acc_dict = {k: [] for k in task_keys}
+        val_acc_dict = {k: [] for k in task_keys}
+        train_auc_dict = {k: [] for k in task_keys}
+        val_auc_dict = {k: [] for k in task_keys}
+
         for epoch in range(args.epochs):
             lr = optimizer.param_groups[0]['lr']
             train_loss, train_acc, train_aucs, train_avg_auc = train_one_epoch(model, train_loader, criterion, optimizer, device)
@@ -265,18 +294,76 @@ def main():
             print(f"Epoch {epoch+1:02d} 🔁 LR: {lr:.2e}")
             print(f"Train Loss: {train_loss:.4f} | Train Acc: {train_aucs} | Train Avg AUC: {train_avg_auc:.4f}")
             print(f"Valid Loss: {val_loss:.4f} | Valid Acc: {val_aucs} | Valid Avg AUC: {val_avg_auc:.4f}")
+
+            train_losses.append(train_loss)
+            val_losses.append(val_loss)
+            train_avg_aucs.append(train_avg_auc)
+            val_avg_aucs.append(val_avg_auc)
+
+            # 以性別、慣用手、球齡、等級四項accuracy的平均做overall acc
+            train_accs.append(np.mean(list(train_acc.values())))
+            val_accs.append(np.mean(list(val_acc.values())))
+            for k in task_keys:
+                train_acc_dict[k].append(train_acc[k])
+                val_acc_dict[k].append(val_acc[k])
+                train_auc_dict[k].append(train_aucs[k])
+                val_auc_dict[k].append(val_aucs[k])
+
             if val_avg_auc > best_auc:
                 best_auc = val_avg_auc
                 torch.save(model.state_dict(), args.model)
                 print("Model saved.")
             scheduler.step(val_avg_auc)
             early_stopping(val_avg_auc)
+
             if early_stopping.early_stop:
-                print(f"⏹️ Early stopping triggered at epoch {epoch+1}")
+                print(f"Early stopping triggered at epoch {epoch+1}")
                 break
+
+        #==========================matplotlib繪圖===========================================
+        epochs = range(1, len(train_losses)+1)
+        plt.figure(figsize=(18,10))
+
+        # Loss 曲線
+        plt.subplot(2,3,1)
+        plt.plot(epochs, train_losses, label="Train Loss")
+        plt.plot(epochs, val_losses, label="Val Loss")
+        plt.xlabel("Epoch"); plt.ylabel("Loss"); plt.legend(); plt.title("Loss Curve")
+
+        # ACC 曲線（平均）
+        plt.subplot(2,3,2)
+        plt.plot(epochs, train_accs, label="Train Mean Acc")
+        plt.plot(epochs, val_accs, label="Val Mean Acc")
+        plt.xlabel("Epoch"); plt.ylabel("Accuracy (Mean)"); plt.legend(); plt.title("Mean Accuracy Curve")
+
+        # ACC 曲線（各項）
+        plt.subplot(2,3,3)
+        for k in task_keys:
+            plt.plot(epochs, train_acc_dict[k], label=f"Train {k}")
+            plt.plot(epochs, val_acc_dict[k], '--', label=f"Val {k}")
+        plt.xlabel("Epoch"); plt.ylabel("Accuracy"); plt.legend(); plt.title("Accuracy by Task")
+
+        # AUC 曲線（平均）
+        plt.subplot(2,3,5)
+        plt.plot(epochs, train_avg_aucs, label="Train Mean AUC")
+        plt.plot(epochs, val_avg_aucs, label="Val Mean AUC")
+        plt.xlabel("Epoch"); plt.ylabel("AUC (Mean)"); plt.legend(); plt.title("Mean AUC Curve")
+
+        # AUC 曲線（各項）
+        plt.subplot(2,3,6)
+        for k in task_keys:
+            plt.plot(epochs, train_auc_dict[k], label=f"Train {k}")
+            plt.plot(epochs, val_auc_dict[k], '--', label=f"Val {k}")
+        plt.xlabel("Epoch"); plt.ylabel("AUC"); plt.legend(); plt.title("AUC by Task")
+
+        plt.tight_layout()
+        plt.savefig("training_curves_all.png")
+        plt.show()
+
     elif args.mode == "test":
         # 載入測試資料
         test_loader = get_test_dataloader(args.test_info, args.test_data, batch_size=args.batch)
+
         # 載入最佳模型
         model = MultiBranchInceptionModel().to(device)
         model.load_state_dict(torch.load(args.model, map_location=device))
