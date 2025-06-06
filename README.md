@@ -48,7 +48,7 @@ pip install tqdm==4.66.4
 ├── main.py                  # 主訓練／推論流程
 ├── model.py                 # InceptionTime 多分支模型定義
 ├── dataset.py               # 資料集處理
-├── augment.py               # 資料增強腳本（可選）
+├── aug.py               # 資料增強腳本（可選）
 └── README.md                # 說明文件
 ```
 
